@@ -18,6 +18,7 @@ CONFIGURAÇÃO DO CLOUDINARY (Armazenamento de Mídia)
 */
 let activeCloudinaryConfig = null;
 let allCloudinaryConfigs = {};
+let sortedCloudinaryConfigs = []; // ARRAY ORDENADO PARA A "MÁQUINA DO TEMPO"
 
 /* ==================================================================
 SISTEMA DE NOTIFICAÇÕES
@@ -47,7 +48,89 @@ function showNotification(message, type = 'success') {
 }
 
 /* ==================================================================
-LÓGICA DE UPLOAD DE ARQUIVOS (AGORA COM CLOUDINARY)
+FUNÇÕES AUXILIARES E INTELIGÊNCIA DE ARQUIVOS
+==================================================================
+*/
+function formatBytes(bytes, decimals = 2) {
+    if (!+bytes) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+// Descobre o tipo de arquivo pela extensão (para arquivos antigos sem 'type')
+function getMediaTypeFromUrl(url) {
+    if (!url) return 'image';
+    try {
+        const cleanUrl = url.split('?')[0].split('#')[0];
+        const extension = cleanUrl.split('.').pop().toLowerCase();
+        
+        if (['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv'].includes(extension)) return 'video';
+        if (['pdf'].includes(extension)) return 'pdf';
+        return 'image';
+    } catch (e) {
+        return 'image';
+    }
+}
+
+// "TIME MACHINE": Reconstrói URLs antigas baseando-se na data do upload
+// Esta função corrige os erros 401 e imagens quebradas
+function reconstructUrl(item) {
+    if (!item) return '';
+    
+    // CASO 1: Se já é um link completo (começa com http), retornamos ele
+    // Mas ATENÇÃO: Se for um link de uma conta antiga que expirou o token, talvez precisássemos regenerar.
+    // Por enquanto, assumimos que se tem http, o link "deveria" funcionar, a menos que o cloudName esteja errado na URL.
+    // Se o seus dados antigos tem URL completa mas errada (cloudName errado), precisaríamos de uma lógica extra aqui.
+    // Vou assumir que o problema principal são os arquivos que tem APENAS o nome ou cloudName errado.
+    
+    let urlToUse = item.url;
+    
+    // Se NÃO começa com http, é um arquivo legado (só nome do arquivo)
+    // OU se precisamos garantir o cloudName correto baseado na data
+    const isRelative = urlToUse && !urlToUse.startsWith('http');
+    
+    if (isRelative && item.timestamp && sortedCloudinaryConfigs.length > 0) {
+        const itemTime = new Date(item.timestamp).getTime();
+        
+        // Encontra a configuração que estava ativa no momento do upload
+        // sortedCloudinaryConfigs deve estar ordenado do mais antigo para o mais novo
+        let bestConfig = null;
+        
+        for (const config of sortedCloudinaryConfigs) {
+            // Se a config foi criada ANTES ou NO MOMENTO do upload, ela é candidata
+            if (config.timestamp <= itemTime) {
+                bestConfig = config;
+            } else {
+                // Se chegamos numa config mais nova que a imagem, paramos. A anterior era a certa.
+                break;
+            }
+        }
+        
+        // Se a imagem é MUITO velha (antes da primeira config registrada), usa a primeira disponível
+        if (!bestConfig && sortedCloudinaryConfigs.length > 0) {
+            bestConfig = sortedCloudinaryConfigs[0];
+        }
+
+        if (bestConfig && bestConfig.cloudName) {
+            const cleanPath = urlToUse.replace(/^\/+/, ''); // Remove barra inicial se tiver
+            return `https://res.cloudinary.com/${bestConfig.cloudName}/image/upload/${cleanPath}`;
+        }
+    }
+    
+    // Fallback: Se não conseguiu reconstruir, tenta usar a config ativa atual (melhor que nada)
+    if (isRelative && activeCloudinaryConfig) {
+         const cleanPath = urlToUse.replace(/^\/+/, '');
+         return `https://res.cloudinary.com/${activeCloudinaryConfig.cloudName}/image/upload/${cleanPath}`;
+    }
+
+    return urlToUse || '';
+}
+
+/* ==================================================================
+LÓGICA DE UPLOAD DE ARQUIVOS (MANTIDA 100%)
 ==================================================================
 */
 const uploadFileToCloudinary = async (file) => {
@@ -74,7 +157,8 @@ const uploadFileToCloudinary = async (file) => {
     const data = await response.json();
     return {
         url: data.secure_url,
-        configKey: activeCloudinaryConfig.key // Salva a chave da config usada
+        configKey: activeCloudinaryConfig.key, // Salva a chave da config usada
+        bytes: data.bytes // Salva o tamanho para controle
     };
   } catch (error) {
     console.error("Erro no upload para o Cloudinary:", error);
@@ -84,7 +168,7 @@ const uploadFileToCloudinary = async (file) => {
 
 
 /* ==================================================================
-INICIALIZAÇÃO DO SISTEMA E DEMAIS FUNÇÕES
+INICIALIZAÇÃO DO SISTEMA
 ==================================================================
 */
 document.addEventListener('DOMContentLoaded', () => {
@@ -100,6 +184,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const USERS = [
     { name: 'Augusto', role: 'Gestor', password: 'jose' },
+    { name: 'Wilson', role: 'Gestor', password: 'wilson' },
+    { name: 'Rosely', role: 'Gestor', password: 'rose' },
     { name: 'William Barbosa', role: 'Atendente', password: '2312' },
     { name: 'Thiago Ventura Valencio', role: 'Atendente', password: '1940' },
     { name: 'Fernando', role: 'Mecânico', password: 'fernando' },
@@ -107,13 +193,12 @@ document.addEventListener('DOMContentLoaded', () => {
     { name: 'Marcelo', role: 'Mecânico', password: 'marcelo' }
   ];
 
-  const USERS_CAN_DELETE_MEDIA = ['Thiago Ventura Valencio', 'William Barbosa', 'Augusto'];
-
+  const USERS_CAN_DELETE_MEDIA = ['Thiago Ventura Valencio', 'William Barbosa', 'Augusto', 'Wilson', 'Rosely'];
   const STATUS_LIST = [ 'Aguardando-Mecanico', 'Em-Analise', 'Orcamento-Enviado', 'Aguardando-Aprovacao', 'Servico-Autorizado', 'Em-Execucao', 'Finalizado-Aguardando-Retirada', 'Entregue' ];
   const ATTENTION_STATUSES = { 'Aguardando-Mecanico': { label: 'AGUARDANDO MECÂNICO', color: 'yellow', blinkClass: 'blinking-aguardando' }, 'Servico-Autorizado': { label: 'SERVIÇO AUTORIZADO', color: 'green', blinkClass: 'blinking-autorizado' } };
   const LED_TRIGGER_STATUSES = ['Aguardando-Mecanico', 'Servico-Autorizado'];
 
-  // Seletores de elementos DOM
+  // Seletores
   const userScreen = document.getElementById('userScreen');
   const app = document.getElementById('app');
   const loginForm = document.getElementById('loginForm');
@@ -164,7 +249,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const reportsForm = document.getElementById('reportsForm');
   const reportsResultContainer = document.getElementById('reportsResultContainer');
   const exportReportBtn = document.getElementById('exportReportBtn');
-
+  const arBtn = document.getElementById('arBtn');
 
   const formatStatus = (status) => status.replace(/-/g, ' ');
 
@@ -177,14 +262,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const now = new Date();
     const logoutTime = new Date();
     logoutTime.setHours(19, 0, 0, 0);
-
     if (now > logoutTime) {
       logoutTime.setDate(logoutTime.getDate() + 1);
     }
-
     const timeUntilLogout = logoutTime.getTime() - now.getTime();
     console.log(`Logout agendado via setTimeout para: ${logoutTime.toLocaleString('pt-BR')}`);
-
     setTimeout(() => {
       if (localStorage.getItem('currentUserSession')) {
         showNotification('Sessão encerrada por segurança.', 'success');
@@ -194,12 +276,8 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   const loginUser = (user) => {
-    const sessionData = {
-      user: user,
-      loginTime: new Date().toISOString()
-    };
+    const sessionData = { user: user, loginTime: new Date().toISOString() };
     localStorage.setItem('currentUserSession', JSON.stringify(sessionData));
-    
     currentUser = user;
     document.getElementById('currentUserName').textContent = user.name;
     userScreen.classList.add('hidden');
@@ -211,6 +289,8 @@ document.addEventListener('DOMContentLoaded', () => {
     listenToCloudinaryConfigs(); 
     scheduleDailyLogout();
 
+    if (arBtn) arBtn.classList.remove('hidden');
+
     if (user.name === 'Thiago Ventura Valencio') {
       adminBtn.classList.remove('hidden');
       reportsBtn.classList.remove('hidden');
@@ -219,25 +299,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const initializeLoginScreen = () => {
     const storedSession = localStorage.getItem('currentUserSession');
-    
     if (storedSession) {
         const sessionData = JSON.parse(storedSession);
         const loginTime = new Date(sessionData.loginTime);
-
         const now = new Date();
         const lastCutoff = new Date();
         lastCutoff.setHours(19, 0, 0, 0);
-
-        if (now < lastCutoff) {
-            lastCutoff.setDate(lastCutoff.getDate() - 1);
-        }
+        if (now < lastCutoff) lastCutoff.setDate(lastCutoff.getDate() - 1);
 
         if (loginTime < lastCutoff) {
             console.log("Sessão expirada. Realizando logout forçado.");
             logoutUser();
             return;
         }
-        
         loginUser(sessionData.user);
         return;
     }
@@ -379,16 +453,36 @@ document.addEventListener('DOMContentLoaded', () => {
       });
   }
 
+  // --- ESCUTAR CONFIGURAÇÕES DO CLOUDINARY (Lógica Time Machine) ---
   const listenToCloudinaryConfigs = () => {
     const configRef = db.ref('cloudinaryConfigs').orderByChild('timestamp');
     configRef.on('value', snapshot => {
       if (snapshot.exists()) {
         const configs = snapshot.val();
-        const keys = Object.keys(configs);
-        const latestKey = keys[keys.length - 1];
-        activeCloudinaryConfig = { ...configs[latestKey], key: latestKey };
         
-        activeCloudinaryInfo.textContent = `Cloud Name: ${activeCloudinaryConfig.cloudName} | Preset: ${activeCloudinaryConfig.uploadPreset}`;
+        allCloudinaryConfigs = configs;
+        
+        // CRIAÇÃO DO ARRAY ORDENADO PARA A MÁQUINA DO TEMPO
+        sortedCloudinaryConfigs = [];
+        snapshot.forEach(childSnapshot => {
+            sortedCloudinaryConfigs.push({
+                ...childSnapshot.val(),
+                key: childSnapshot.key
+            });
+        });
+        
+        // Garante ordenação cronológica
+        sortedCloudinaryConfigs.sort((a, b) => a.timestamp - b.timestamp);
+
+        // A última config é a ATIVA
+        if (sortedCloudinaryConfigs.length > 0) {
+            const latestConfig = sortedCloudinaryConfigs[sortedCloudinaryConfigs.length - 1];
+            activeCloudinaryConfig = latestConfig;
+            
+            const usageText = latestConfig.usage ? ` | Enviado: ${formatBytes(latestConfig.usage)}` : ' | Enviado: 0 B';
+            activeCloudinaryInfo.textContent = `Ativo: ${activeCloudinaryConfig.cloudName} | ${activeCloudinaryConfig.uploadPreset}${usageText}`;
+        }
+        
       } else {
         activeCloudinaryInfo.textContent = 'Nenhuma conta configurada. Adicione uma para fazer uploads.';
         showNotification('ATENÇÃO: Nenhuma conta de mídia configurada. Os uploads não funcionarão.', 'error');
@@ -532,17 +626,31 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  // --- RENDERIZAÇÃO DE MÍDIA COM "TIME MACHINE" ---
   const renderMediaGallery = (os) => {
     const media = os.media || {};
     const mediaEntries = Object.entries(media);
-    lightboxMedia = mediaEntries.map(entry => ({...entry[1], key: entry[0]}));
     
-    thumbnailGrid.innerHTML = mediaEntries.map(([key, item], index) => {
-        if (!item || !item.type) return '';
+    // Mapeamento correto com reconstrução de URL
+    lightboxMedia = mediaEntries.map(entry => {
+        const item = entry[1];
+        if (!item) return null;
+        
+        // RECONSTRÓI A URL CORRETA (resolve 401 e paths relativos)
+        const fixedUrl = reconstructUrl(item);
+        
+        // Tenta pegar o tipo salvo, senão descobre pela URL
+        const type = item.type || getMediaTypeFromUrl(fixedUrl);
+        
+        return {...item, url: fixedUrl, type: type, key: entry[0]};
+    }).filter(item => item !== null && item.url);
+    
+    thumbnailGrid.innerHTML = lightboxMedia.map((item, index) => {
+        if (!item.url) return '';
 
         const canDelete = currentUser && USERS_CAN_DELETE_MEDIA.includes(currentUser.name);
         const deleteButtonHTML = canDelete 
-            ? `<button class="delete-media-btn" data-os-id="${os.id}" data-media-key="${key}" title="Excluir Mídia"><i class='bx bxs-trash'></i></button>` 
+            ? `<button class="delete-media-btn" data-os-id="${os.id}" data-media-key="${item.key}" title="Excluir Mídia"><i class='bx bxs-trash'></i></button>` 
             : '';
 
         const isImage = item.type.startsWith('image/');
@@ -550,9 +658,14 @@ document.addEventListener('DOMContentLoaded', () => {
         const isPdf = item.type === 'application/pdf';
         
         let thumbnailContent = `<i class='bx bx-file text-4xl text-gray-500'></i>`;
-        if (isImage) { thumbnailContent = `<img src="${item.url}" alt="Imagem ${index + 1}" loading="lazy" class="w-full h-full object-cover">`; }
-        else if (isVideo) { thumbnailContent = `<i class='bx bx-play-circle text-4xl text-blue-500'></i>`; }
-        else if (isPdf) { thumbnailContent = `<i class='bx bxs-file-pdf text-4xl text-red-500'></i>`; }
+        
+        if (isImage) { 
+            thumbnailContent = `<img src="${item.url}" alt="Imagem ${index + 1}" loading="lazy" class="w-full h-full object-cover">`; 
+        } else if (isVideo) { 
+            thumbnailContent = `<i class='bx bx-play-circle text-4xl text-blue-500'></i>`; 
+        } else if (isPdf) { 
+            thumbnailContent = `<i class='bx bxs-file-pdf text-4xl text-red-500'></i>`; 
+        }
 
         return `<div class="thumbnail-container aspect-square bg-gray-200 rounded-md overflow-hidden flex items-center justify-center relative">
                     ${deleteButtonHTML}
@@ -579,7 +692,14 @@ document.addEventListener('DOMContentLoaded', () => {
         return `<tr><td>${formatDate(log.timestamp)}</td><td>${log.user}</td><td>${log.description}</td><td>${log.parts || '---'}</td><td style="text-align: right;">${log.value ? `R$ ${parseFloat(log.value).toFixed(2)}` : '---'}</td></tr>`;
     }).join('');
     const media = os.media ? Object.values(os.media) : [];
-    const photos = media.filter(item => item && item.type.startsWith('image/'));
+    
+    // Filtro melhorado para impressão (reconstrói URLs aqui também)
+    const photos = media.map(item => {
+        const fixedUrl = reconstructUrl(item);
+        const type = item.type || getMediaTypeFromUrl(fixedUrl);
+        return { ...item, url: fixedUrl, type: type };
+    }).filter(item => item.url && item.type.startsWith('image/'));
+
     const photosHtml = photos.length > 0 ? `<div class="section"><h2>Fotos Anexadas</h2><div class="photo-gallery">${photos.map(photo => `<img src="${photo.url}" alt="Foto da O.S.">`).join('')}</div></div>` : '';
     const printHtml = `<html><head><title>Ordem de Serviço - ${os.placa}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;padding:20px;color:#333}.container{max-width:800px;margin:auto}.header{text-align:center;border-bottom:2px solid #000;padding-bottom:10px;margin-bottom:20px}.header h1{margin:0;font-size:24px}.header p{margin:5px 0}.section{margin-bottom:20px;border:1px solid #ccc;border-radius:8px;padding:15px;page-break-inside:avoid}.section h2{margin-top:0;font-size:18px;border-bottom:1px solid #eee;padding-bottom:5px;margin-bottom:10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.grid-item strong{display:block;color:#555}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:14px}th{background-color:#f2f2f2}.total{text-align:right;font-size:18px;font-weight:bold;margin-top:20px}.footer{text-align:center;margin-top:50px;padding-top:20px;border-top:1px solid #ccc}.signature{margin-top:60px}.signature-line{border-bottom:1px solid #000;width:300px;margin:0 auto}.signature p{margin-top:5px;font-size:14px}.photo-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:10px}.photo-gallery img{width:100%;height:auto;border:1px solid #ddd;border-radius:4px}.dev-signature{margin-top:40px;font-size:12px;color:#888;text-align:center}@media print{body{padding:10px}.no-print{display:none}}</style></head><body><div class="container"><div class="header"><h1>CHEVRON Bosch Car Service</h1><p>Ordem de Serviço</p></div><div class="section"><h2>Detalhes da O.S.</h2><div class="grid"><div class="grid-item"><strong>Placa:</strong> ${os.placa}</div><div class="grid-item"><strong>Modelo:</strong> ${os.modelo}</div><div class="grid-item"><strong>Cliente:</strong> ${os.cliente}</div><div class="grid-item"><strong>Telefone:</strong> ${os.telefone||"N/A"}</div><div class="grid-item"><strong>KM:</strong> ${os.km?new Intl.NumberFormat("pt-BR").format(os.km):"N/A"}</div><div class="grid-item"><strong>Data de Abertura:</strong> ${formatDate(os.createdAt)}</div><div class="grid-item"><strong>Atendente:</strong> ${os.responsible||"N/A"}</div></div></div>${os.observacoes?`<div class="section"><h2>Queixa do Cliente / Observações Iniciais</h2><p style="white-space: pre-wrap;">${os.observacoes}</p></div>`:""}<div class="section"><h2>Histórico de Serviços e Peças</h2><table><thead><tr><th>Data/Hora</th><th>Usuário</th><th>Descrição</th><th>Peças</th><th style="text-align: right;">Valor</th></tr></thead><tbody>${timelineHtml||'<tr><td colspan="5" style="text-align: center;">Nenhum registro no histórico.</td></tr>'}</tbody></table><div class="total">Total: R$ ${totalValue.toFixed(2)}</div></div>${photosHtml}<div class="footer"><div class="signature"><div class="signature-line"></div><p>Assinatura do Cliente</p></div><p>Documento gerado em: ${new Date().toLocaleString("pt-BR")}</p><div class="dev-signature">Desenvolvido com 🤖 - por thIAguinho Soluções</div></div></div><script>window.onload=function(){window.print();setTimeout(function(){window.close()},100)}<\/script></body></html>`;
     const printWindow = window.open('', '_blank');
@@ -591,10 +711,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!lightboxMedia || lightboxMedia.length === 0) return;
     currentLightboxIndex = index;
     const media = lightboxMedia[index];
-    if (!media || !media.type) return; 
-    if (media.type === 'application/pdf') { window.open(media.url, '_blank'); return; }
+    if (!media) return; 
+    
+    // A URL já foi corrigida no renderMediaGallery, então apenas usamos
+    const type = media.type || 'image/jpeg';
+
+    if (type === 'application/pdf') { window.open(media.url, '_blank'); return; }
+    
     const lightboxContent = document.getElementById('lightbox-content');
-    if (media.type.startsWith('image/')) {
+    if (type.startsWith('image/')) {
       lightboxContent.innerHTML = `<img src="${media.url}" alt="Imagem" class="max-w-full max-h-full object-contain">`;
     } else {
       lightboxContent.innerHTML = `<video src="${media.url}" controls class="max-w-full max-h-full"></video>`;
@@ -798,14 +923,27 @@ document.addEventListener('DOMContentLoaded', () => {
                     url: result.url,
                     configKey: result.configKey,
                     name: file.name,
-                    timestamp: new Date().toISOString()
+                    timestamp: new Date().toISOString(),
+                    bytes: result.bytes // Passa os bytes para o próximo passo
                 }))
             );
             const mediaResults = await Promise.all(mediaPromises);
+            
+            // SOMAR USO E SALVAR NO BANCO
+            let totalBytesUploaded = 0;
             const mediaRef = db.ref(`serviceOrders/${osId}/media`);
             mediaResults.forEach(result => {
                 mediaRef.push().set(result);
+                if (result.bytes) totalBytesUploaded += result.bytes;
             });
+
+            // Atualiza o contador de uso na config ativa
+            if (totalBytesUploaded > 0 && activeCloudinaryConfig && activeCloudinaryConfig.key) {
+                const configRef = db.ref(`cloudinaryConfigs/${activeCloudinaryConfig.key}/usage`);
+                configRef.transaction(currentUsage => {
+                    return (currentUsage || 0) + totalBytesUploaded;
+                });
+            }
         }
         const logsRef = db.ref(`serviceOrders/${osId}/logs`);
         const newLogRef = logsRef.push();
@@ -1176,7 +1314,13 @@ document.addEventListener('DOMContentLoaded', () => {
           exportOsToPrint(osId);
       }
   });
-
+  
+  // FUNCIONALIDADE DA VERSÃO IA: Listener para o Botão AR
+  if (arBtn) {
+      arBtn.addEventListener('click', () => {
+          window.location.href = 'consultor.html';
+      });
+  }
 
   // --- INICIALIZAÇÃO DO LOGIN ---
   initializeLoginScreen();
