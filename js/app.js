@@ -7,7 +7,7 @@ const firebaseConfig = {
   authDomain: "dashboard-oficina-pro.firebaseapp.com",
   databaseURL: "https://dashboard-oficina-pro-default-rtdb.firebaseio.com",
   projectId: "dashboard-oficina-pro",
-  storageBucket: "dashboard-oficina-pro.firebasestorage.app", // Confirme se está ativo no Console
+  storageBucket: "dashboard-oficina-pro.firebasestorage.app", // Storage Nativo
   messagingSenderId: "736157192887",
   appId: "1:736157192887:web:c23d3daade848a33d67332"
 };
@@ -66,8 +66,9 @@ function getMediaTypeFromUrl(url) {
     try {
         // Se for Firebase Storage e tiver token de imagem
         if (url.includes('firebasestorage')) {
-             if (url.toLowerCase().includes('video') || url.match(/\.(mp4|webm|ogg)\?/i)) return 'video';
-             if (url.toLowerCase().includes('pdf') || url.match(/\.pdf\?/i)) return 'pdf';
+             const lowerUrl = url.toLowerCase();
+             if (lowerUrl.includes('.mp4') || lowerUrl.includes('video') || lowerUrl.match(/\.(mp4|webm|ogg)\?/i)) return 'video';
+             if (lowerUrl.includes('.pdf') || lowerUrl.match(/\.pdf\?/i)) return 'pdf';
              return 'image';
         }
 
@@ -90,18 +91,12 @@ function reconstructUrl(item) {
     // 1. Se não tem URL, retorna vazio
     if (!urlToUse) return '';
 
-    // 2. Se for Firebase (Novo Sistema), confia na URL
-    if (urlToUse.includes('firebasestorage.googleapis.com')) {
-        return urlToUse;
-    }
-
-    // 3. Se já é URL completa (Cloudinary antigo ok), retorna
-    if (urlToUse.startsWith('http')) {
+    // 2. Se for Firebase (Novo Sistema) ou URL completa, confia na URL
+    if (urlToUse.includes('firebasestorage') || urlToUse.startsWith('http')) {
         return urlToUse;
     }
     
-    // 4. Lógica para reconstruir Cloudinary legado (só nome do arquivo)
-    // Corrige erro de contas antigas e o erro do espaço no nome
+    // 3. Lógica para reconstruir Cloudinary legado (só nome do arquivo)
     if (item.timestamp && sortedCloudinaryConfigs.length > 0) {
         const itemTime = new Date(item.timestamp).getTime();
         let bestConfig = null;
@@ -120,13 +115,13 @@ function reconstructUrl(item) {
 
         if (bestConfig && bestConfig.cloudName) {
             const cleanPath = urlToUse.replace(/^\/+/, '');
-            // CORREÇÃO CRÍTICA: Remove o espaço do nome do banco (" dyjl...")
+            // CORREÇÃO CRÍTICA: Remove o espaço do nome do banco
             const cleanCloudName = bestConfig.cloudName.trim();
             return `https://res.cloudinary.com/${cleanCloudName}/image/upload/${cleanPath}`;
         }
     }
     
-    // Último recurso Cloudinary
+    // Último recurso Cloudinary Ativo
     if (activeCloudinaryConfig) {
          const cleanPath = urlToUse.replace(/^\/+/, '');
          return `https://res.cloudinary.com/${activeCloudinaryConfig.cloudName.trim()}/image/upload/${cleanPath}`;
@@ -234,10 +229,13 @@ const uploadToFirebase = async (file) => {
     // Organiza por Ano/Mes
     const date = new Date();
     const folder = `imagens/${date.getFullYear()}/${date.getMonth() + 1}`;
-    // Nome único
-    const fileName = `${Date.now()}_${compressedFile.name.replace(/[^a-zA-Z0-9.]/g, '')}`;
+    // Nome único limpo
+    const cleanName = compressedFile.name.replace(/[^a-zA-Z0-9.]/g, '_');
+    const fileName = `${Date.now()}_${cleanName}`;
     
     const storageRef = firebase.storage().ref().child(`${folder}/${fileName}`);
+    
+    // Upload
     const snapshot = await storageRef.put(compressedFile);
     const downloadURL = await snapshot.ref.getDownloadURL();
     
@@ -258,7 +256,7 @@ const processUpload = async (file, db) => {
         showNotification("Otimizando e enviando para Firebase...", "info");
         result = await uploadToFirebase(file);
         
-        // Contador do Firebase
+        // Contador do Firebase (NOVO)
         const fbUsageRef = db.ref('firebaseStorageUsage');
         fbUsageRef.transaction(current => (current || 0) + result.bytes);
         
@@ -267,7 +265,7 @@ const processUpload = async (file, db) => {
         showNotification("Enviando vídeo para Cloudinary...", "info");
         result = await uploadToCloudinary(file);
         
-        // Contador do Cloudinary (Mantido)
+        // Contador do Cloudinary (MANTIDO)
         if (activeCloudinaryConfig && activeCloudinaryConfig.key) {
             const configRef = db.ref(`cloudinaryConfigs/${activeCloudinaryConfig.key}/usage`);
             configRef.transaction(current => (current || 0) + result.bytes);
@@ -818,6 +816,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     const lightboxContent = document.getElementById('lightbox-content');
     if (type.startsWith('image/')) {
+      // CORREÇÃO TAMBÉM NO LIGHTBOX: referrerpolicy
       lightboxContent.innerHTML = `<img src="${media.url}" alt="Imagem" class="max-w-full max-h-full object-contain" referrerpolicy="no-referrer">`;
     } else {
       lightboxContent.innerHTML = `<video src="${media.url}" controls class="max-w-full max-h-full"></video>`;
@@ -1002,7 +1001,6 @@ document.addEventListener('DOMContentLoaded', () => {
     osModal.classList.add('hidden');
   });
 
-  // UPLOAD HÍBRIDO NO SUBMIT
   logForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const submitBtn = e.target.querySelector('button[type="submit"]');
@@ -1227,6 +1225,37 @@ document.addEventListener('DOMContentLoaded', () => {
     cloudinaryForm.reset();
     adminModal.classList.remove('hidden');
     adminModal.classList.add('flex');
+    
+    // --- LÓGICA DO CONTADOR PARA O THIAGO ---
+    const statsContainer = document.getElementById('activeCloudinaryInfo');
+    statsContainer.innerHTML = '<p>Carregando estatísticas...</p>';
+
+    // 1. Pega uso do Firebase
+    db.ref('firebaseStorageUsage').once('value').then(snap => {
+        const fbBytes = snap.val() || 0;
+
+        // 2. Calcula uso total do Cloudinary (Soma de todas as contas)
+        let cloudBytes = 0;
+        Object.values(allCloudinaryConfigs).forEach(conf => {
+            if (conf.usage) cloudBytes += conf.usage;
+        });
+
+        // 3. Monta o HTML
+        let html = `<div class="space-y-2 text-sm text-gray-700">`;
+        html += `<div class="flex justify-between border-b pb-1"><span><strong>Firebase (Imagens):</strong></span> <span>${formatBytes(fbBytes)}</span></div>`;
+        html += `<div class="flex justify-between border-b pb-1"><span><strong>Cloudinary Total (Vídeos):</strong></span> <span>${formatBytes(cloudBytes)}</span></div>`;
+        
+        if (activeCloudinaryConfig) {
+            const activeUsage = activeCloudinaryConfig.usage || 0;
+             html += `<div class="mt-2 text-xs text-gray-500 bg-gray-50 p-2 rounded">
+                <p><strong>Conta Ativa:</strong> ${activeCloudinaryConfig.cloudName}</p>
+                <p><strong>Uso desta conta:</strong> ${formatBytes(activeUsage)}</p>
+             </div>`;
+        }
+        html += `</div>`;
+
+        statsContainer.innerHTML = html;
+    });
   });
 
   cloudinaryForm.addEventListener('submit', (e) => {
