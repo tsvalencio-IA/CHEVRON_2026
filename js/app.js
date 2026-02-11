@@ -64,6 +64,7 @@ LÓGICA DE UPLOAD DE ARQUIVOS (AGORA COM CLOUDINARY)
 ==================================================================
 */
 const uploadFileToCloudinary = async (file) => {
+  // Para UPLOAD, usamos apenas a conta ATIVA (a mais recente)
   if (!activeCloudinaryConfig) {
     throw new Error('Configuração da conta de mídia não encontrada. Adicione uma no painel de admin.');
   }
@@ -87,8 +88,8 @@ const uploadFileToCloudinary = async (file) => {
     const data = await response.json();
     return {
         url: data.secure_url,
-        configKey: activeCloudinaryConfig.key, // Salva a chave da config usada
-        bytes: data.bytes // Retorna o tamanho do arquivo
+        configKey: activeCloudinaryConfig.key, // Salva qual conta foi usada
+        bytes: data.bytes // Salva o tamanho para controle
     };
   } catch (error) {
     console.error("Erro no upload para o Cloudinary:", error);
@@ -400,28 +401,31 @@ document.addEventListener('DOMContentLoaded', () => {
       });
   }
 
-  // CORREÇÃO AQUI: Garante que a última config seja selecionada corretamente respeitando a ordem do banco
+  // --- ESCUTAR CONFIGURAÇÕES DO CLOUDINARY (RODÍZIO) ---
   const listenToCloudinaryConfigs = () => {
     const configRef = db.ref('cloudinaryConfigs').orderByChild('timestamp');
     configRef.on('value', snapshot => {
       if (snapshot.exists()) {
         const configs = snapshot.val();
-        // Atualiza a variável global que estava sendo ignorada
+        
+        // Armazenamos todas as configs (caso precisemos para exclusão futura)
         allCloudinaryConfigs = configs;
         
         let latestConfig = null;
         let latestKey = null;
 
-        // Itera na ordem correta garantida pelo Firebase
+        // Itera na ordem correta garantida pelo Firebase para pegar o ÚLTIMO (Ativo)
         snapshot.forEach(childSnapshot => {
             latestConfig = childSnapshot.val();
             latestKey = childSnapshot.key;
         });
 
         if (latestConfig) {
+            // Define a conta ATIVA para NOVOS uploads
             activeCloudinaryConfig = { ...latestConfig, key: latestKey };
+            
             const usageText = latestConfig.usage ? ` | Enviado: ${formatBytes(latestConfig.usage)}` : ' | Enviado: 0 B';
-            activeCloudinaryInfo.textContent = `Cloud Name: ${activeCloudinaryConfig.cloudName} | Preset: ${activeCloudinaryConfig.uploadPreset}${usageText}`;
+            activeCloudinaryInfo.textContent = `Ativo: ${activeCloudinaryConfig.cloudName} | ${activeCloudinaryConfig.uploadPreset}${usageText}`;
         }
         
       } else {
@@ -567,25 +571,23 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
-  // CORREÇÃO AQUI: Lógica robusta para exibir imagens antigas (Legacy) + TRATAMENTO DE ERRO 401
+  // --- RENDERIZAÇÃO DE MÍDIA CORRIGIDA PARA RODÍZIO ---
   const renderMediaGallery = (os) => {
     const media = os.media || {};
     const mediaEntries = Object.entries(media);
     
-    // Preparar lista para Lightbox com tratamento de erro
+    // Preparar lista para Lightbox
     lightboxMedia = mediaEntries.map(entry => {
         const item = entry[1];
         // Fallback: Se não tiver tipo, assume imagem se tiver URL
         const type = item.type || (item.url ? 'image/jpeg' : ''); 
         return { ...item, type: type, key: entry[0] };
-    }).filter(item => item.url); // Só inclui se tiver URL válida
+    }).filter(item => item.url);
     
     thumbnailGrid.innerHTML = mediaEntries.map(([key, item], index) => {
-        // Se o item for nulo, pula
         if (!item) return '';
         
-        // CORREÇÃO CRÍTICA: Se não tiver 'type', tentamos inferir ou permitimos renderizar se tiver URL
-        // Itens antigos no banco podem não ter a propriedade 'type' salva
+        // Verifica se tem URL. Se tiver URL, deve mostrar, independente da conta.
         const hasType = !!item.type;
         const hasUrl = !!item.url;
         
@@ -601,8 +603,7 @@ document.addEventListener('DOMContentLoaded', () => {
             isVideo = item.type.startsWith('video/');
             isPdf = item.type === 'application/pdf';
         } else if (hasUrl) {
-            // Se não tem tipo, assume que é imagem (comportamento padrão para legado)
-            // Ou verifica extensão simples
+            // Se não tem tipo, assume que é imagem (legado)
             isImage = true; 
         }
 
@@ -614,9 +615,9 @@ document.addEventListener('DOMContentLoaded', () => {
         let thumbnailContent = `<i class='bx bx-file text-4xl text-gray-500'></i>`;
         
         if (isImage) { 
-            const fallbackHTML = "<div class='flex flex-col items-center justify-center w-full h-full bg-gray-100 text-gray-400 p-2 text-center'><i class='bx bxs-error-circle text-2xl mb-1 text-red-300'></i><span class='text-[10px] leading-tight'>Indisponível (Conta Expirada)</span></div>";
-            // Adicionado onerror para capturar 401 e mostrar mensagem amigável
-            thumbnailContent = `<img src="${item.url}" alt="Mídia" loading="lazy" class="w-full h-full object-cover" onerror="this.parentElement.innerHTML='${fallbackHTML}'">`; 
+            // CORREÇÃO: Removido 'onerror' complexo que escondia imagens antigas. 
+            // Agora apenas tenta renderizar a URL. Se o navegador conseguir acessar, mostra.
+            thumbnailContent = `<img src="${item.url}" alt="Mídia" loading="lazy" class="w-full h-full object-cover">`; 
         } else if (isVideo) { 
             thumbnailContent = `<i class='bx bx-play-circle text-4xl text-blue-500'></i>`; 
         } else if (isPdf) { 
@@ -649,7 +650,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }).join('');
     const media = os.media ? Object.values(os.media) : [];
     
-    // Filtro para impressão também precisa considerar itens sem 'type'
+    // Filtro para impressão
     const photos = media.filter(item => {
         if (item.type) return item.type.startsWith('image/');
         return !!item.url; // Assume imagem se tiver URL e sem tipo
@@ -666,9 +667,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!lightboxMedia || lightboxMedia.length === 0) return;
     currentLightboxIndex = index;
     const media = lightboxMedia[index];
-    if (!media) return; // Proteção extra
+    if (!media) return; 
 
-    // Fallback se não tiver tipo, mas tiver URL
     const type = media.type || 'image/jpeg';
     
     if (type === 'application/pdf') { window.open(media.url, '_blank'); return; }
