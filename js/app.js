@@ -1,5 +1,5 @@
 /* ==================================================================
-CONFIGURAÇÃO DO FIREBASE (Banco de Dados)
+CONFIGURAÇÃO DO FIREBASE (Banco de Dados + Storage)
 ==================================================================
 */
 const firebaseConfig = {
@@ -7,13 +7,13 @@ const firebaseConfig = {
   authDomain: "dashboard-oficina-pro.firebaseapp.com",
   databaseURL: "https://dashboard-oficina-pro-default-rtdb.firebaseio.com",
   projectId: "dashboard-oficina-pro",
-  storageBucket: "dashboard-oficina-pro.appspot.com",
+  storageBucket: "dashboard-oficina-pro.firebasestorage.app", // Confirme se está ativo no Console
   messagingSenderId: "736157192887",
   appId: "1:736157192887:web:c23d3daade848a33d67332"
 };
 
 /* ==================================================================
-CONFIGURAÇÃO DO CLOUDINARY (Armazenamento de Mídia)
+VARIÁVEIS GLOBAIS
 ==================================================================
 */
 let activeCloudinaryConfig = null;
@@ -60,10 +60,17 @@ function formatBytes(bytes, decimals = 2) {
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
 }
 
-// Descobre o tipo de arquivo pela extensão (para arquivos antigos sem 'type')
+// Descobre o tipo de arquivo pela extensão ou URL
 function getMediaTypeFromUrl(url) {
     if (!url) return 'image';
     try {
+        // Se for Firebase Storage e tiver token de imagem
+        if (url.includes('firebasestorage')) {
+             if (url.toLowerCase().includes('video') || url.match(/\.(mp4|webm|ogg)\?/i)) return 'video';
+             if (url.toLowerCase().includes('pdf') || url.match(/\.pdf\?/i)) return 'pdf';
+             return 'image';
+        }
+
         const cleanUrl = url.split('?')[0].split('#')[0];
         const extension = cleanUrl.split('.').pop().toLowerCase();
         
@@ -75,66 +82,65 @@ function getMediaTypeFromUrl(url) {
     }
 }
 
-// "TIME MACHINE": Reconstrói URLs antigas baseando-se na data do upload
+// "TIME MACHINE": Reconstrói URLs antigas e valida as novas
 function reconstructUrl(item) {
     if (!item) return '';
     let urlToUse = item.url;
     
-    // Se não tem URL, retorna vazio
+    // 1. Se não tem URL, retorna vazio
     if (!urlToUse) return '';
 
-    // Se já é URL completa (começa com http), retornamos ela
-    // Isso deve resolver o problema de imagens que já tem o link salvo corretamente
+    // 2. Se for Firebase (Novo Sistema), confia na URL
+    if (urlToUse.includes('firebasestorage.googleapis.com')) {
+        return urlToUse;
+    }
+
+    // 3. Se já é URL completa (Cloudinary antigo ok), retorna
     if (urlToUse.startsWith('http')) {
         return urlToUse;
     }
     
-    // Se é caminho relativo (apenas nome do arquivo), precisamos encontrar qual conta era a dona
+    // 4. Lógica para reconstruir Cloudinary legado (só nome do arquivo)
+    // Corrige erro de contas antigas e o erro do espaço no nome
     if (item.timestamp && sortedCloudinaryConfigs.length > 0) {
         const itemTime = new Date(item.timestamp).getTime();
         let bestConfig = null;
         
-        // sortedCloudinaryConfigs está ordenado do mais antigo para o mais novo
         for (const config of sortedCloudinaryConfigs) {
-            // Se a config foi criada ANTES ou NO MOMENTO do arquivo, ela é candidata
             if (config.timestamp <= itemTime) {
                 bestConfig = config;
             } else {
-                // Se a config é mais nova que o arquivo, paramos. A anterior era a certa.
                 break;
             }
         }
         
-        // Fallback: Se o arquivo é muito antigo (antes da primeira config registrada), usa a primeira disponível
         if (!bestConfig && sortedCloudinaryConfigs.length > 0) {
             bestConfig = sortedCloudinaryConfigs[0];
         }
 
         if (bestConfig && bestConfig.cloudName) {
             const cleanPath = urlToUse.replace(/^\/+/, '');
-            // CORREÇÃO CRÍTICA: .trim() garante que espaços no nome da conta no banco não quebrem a URL
-            // Isso conserta o erro da conta "-Ol1fLyD4NEFIQdJPiIB" que tem espaço no nome
+            // CORREÇÃO CRÍTICA: Remove o espaço do nome do banco (" dyjl...")
             const cleanCloudName = bestConfig.cloudName.trim();
             return `https://res.cloudinary.com/${cleanCloudName}/image/upload/${cleanPath}`;
         }
     }
     
-    // Último recurso: tenta usar a conta ativa atual
+    // Último recurso Cloudinary
     if (activeCloudinaryConfig) {
          const cleanPath = urlToUse.replace(/^\/+/, '');
-         const cleanCloudName = activeCloudinaryConfig.cloudName.trim();
-         return `https://res.cloudinary.com/${cleanCloudName}/image/upload/${cleanPath}`;
+         return `https://res.cloudinary.com/${activeCloudinaryConfig.cloudName.trim()}/image/upload/${cleanPath}`;
     }
 
     return urlToUse;
 }
 
 /* ==================================================================
-MOTOR DE COMPRESSÃO DE IMAGEM (A Solução para os 25GB)
+MOTOR DE COMPRESSÃO (PARA IMAGENS NO FIREBASE)
 ==================================================================
 */
 const compressImage = async (file) => {
-    // Se não for imagem (video/pdf), retorna o arquivo original sem mexer
+    // Só comprime imagens
     if (!file.type.startsWith('image/')) return file;
 
     return new Promise((resolve) => {
@@ -147,7 +153,7 @@ const compressImage = async (file) => {
                 const canvas = document.createElement('canvas');
                 const ctx = canvas.getContext('2d');
                 
-                // Redimensiona para HD (1280px) - Redução massiva de tamanho mantendo qualidade visual
+                // Redimensiona para HD (1280px)
                 const maxWidth = 1280; 
                 const maxHeight = 1280;
                 let width = img.width;
@@ -169,12 +175,8 @@ const compressImage = async (file) => {
                 canvas.height = height;
                 ctx.drawImage(img, 0, 0, width, height);
 
-                // Comprime JPEG para 70% de qualidade
+                // Comprime JPEG 70%
                 canvas.toBlob((blob) => {
-                    if (!blob) {
-                        resolve(file); // Se der erro na compressão, devolve o original
-                        return;
-                    }
                     const compressedFile = new File([blob], file.name, {
                         type: 'image/jpeg',
                         lastModified: Date.now(),
@@ -183,66 +185,101 @@ const compressImage = async (file) => {
                     resolve(compressedFile);
                 }, 'image/jpeg', 0.7);
             };
-            img.onerror = () => resolve(file); // Se a imagem falhar ao carregar, devolve original
+            img.onerror = () => resolve(file);
         };
-        reader.onerror = () => resolve(file); // Se o leitor falhar, devolve original
+        reader.onerror = () => resolve(file);
     });
 };
 
 /* ==================================================================
-LÓGICA DE UPLOAD DE ARQUIVOS (CLOUDINARY + COMPRESSÃO + CONTADOR)
+LÓGICA DE UPLOAD HÍBRIDA (FIREBASE PARA FOTOS / CLOUDINARY PARA VÍDEOS)
 ==================================================================
 */
-const uploadFileToCloudinary = async (file) => {
-  if (!activeCloudinaryConfig) {
-    throw new Error('Configuração da conta de mídia não encontrada. Adicione uma no painel de admin.');
-  }
 
-  // 1. APLICA COMPRESSÃO ANTES DE SUBIR
-  let fileToUpload = file;
-  try {
-      if (file.type.startsWith('image/')) {
-          showNotification(`Comprimindo imagem...`, 'info');
-          fileToUpload = await compressImage(file);
-      }
-  } catch (err) {
-      console.warn("Falha na compressão, enviando original", err);
+// Função 1: Upload para Cloudinary (Para Vídeos/PDFs) - Mantém lógica de rodízio
+const uploadToCloudinary = async (file) => {
+  if (!activeCloudinaryConfig) {
+    throw new Error('Configuração Cloudinary não encontrada para vídeo/pdf.');
   }
 
   const { cloudName, uploadPreset } = activeCloudinaryConfig;
   const formData = new FormData();
-  formData.append('file', fileToUpload);
+  formData.append('file', file);
   formData.append('upload_preset', uploadPreset);
 
-  try {
-    // Garante que o cloudName não tenha espaços (Correção do banco)
-    const cleanCloudName = cloudName.trim();
-    
-    const response = await fetch(`https://api.cloudinary.com/v1_1/${cleanCloudName}/auto/upload`, {
-      method: 'POST',
-      body: formData
-    });
+  const cleanCloudName = cloudName.trim();
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${cleanCloudName}/auto/upload`, {
+    method: 'POST',
+    body: formData
+  });
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error.message || 'Falha no upload da mídia.');
-    }
-
-    const data = await response.json();
-    return {
-        url: data.secure_url,
-        configKey: activeCloudinaryConfig.key, // Salva a chave da config usada
-        bytes: data.bytes // Salva o tamanho (agora reduzido pela compressão)
-    };
-  } catch (error) {
-    console.error("Erro no upload para o Cloudinary:", error);
-    throw error;
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(errorData.error.message || 'Falha no upload Cloudinary.');
   }
+
+  const data = await response.json();
+  return {
+      url: data.secure_url,
+      configKey: activeCloudinaryConfig.key, // Mantém referência da conta
+      bytes: data.bytes,
+      storageType: 'cloudinary'
+  };
+};
+
+// Função 2: Upload para Firebase (Para Imagens)
+const uploadToFirebase = async (file) => {
+    const compressedFile = await compressImage(file);
+    
+    // Organiza por Ano/Mes
+    const date = new Date();
+    const folder = `imagens/${date.getFullYear()}/${date.getMonth() + 1}`;
+    // Nome único
+    const fileName = `${Date.now()}_${compressedFile.name.replace(/[^a-zA-Z0-9.]/g, '')}`;
+    
+    const storageRef = firebase.storage().ref().child(`${folder}/${fileName}`);
+    const snapshot = await storageRef.put(compressedFile);
+    const downloadURL = await snapshot.ref.getDownloadURL();
+    
+    return {
+        url: downloadURL,
+        bytes: snapshot.totalBytes,
+        storageType: 'firebase',
+        name: file.name
+    };
+};
+
+// Função Principal: Gerente de Upload
+const processUpload = async (file, db) => {
+    let result;
+    
+    if (file.type.startsWith('image/')) {
+        // IMAGENS -> FIREBASE
+        showNotification("Otimizando e enviando para Firebase...", "info");
+        result = await uploadToFirebase(file);
+        
+        // Contador do Firebase
+        const fbUsageRef = db.ref('firebaseStorageUsage');
+        fbUsageRef.transaction(current => (current || 0) + result.bytes);
+        
+    } else {
+        // VÍDEOS/PDFs -> CLOUDINARY
+        showNotification("Enviando vídeo para Cloudinary...", "info");
+        result = await uploadToCloudinary(file);
+        
+        // Contador do Cloudinary (Mantido)
+        if (activeCloudinaryConfig && activeCloudinaryConfig.key) {
+            const configRef = db.ref(`cloudinaryConfigs/${activeCloudinaryConfig.key}/usage`);
+            configRef.transaction(current => (current || 0) + result.bytes);
+        }
+    }
+    
+    return result;
 };
 
 
 /* ==================================================================
-INICIALIZAÇÃO DO SISTEMA E DEMAIS FUNÇÕES
+INICIALIZAÇÃO DO SISTEMA
 ==================================================================
 */
 document.addEventListener('DOMContentLoaded', () => {
@@ -268,12 +305,11 @@ document.addEventListener('DOMContentLoaded', () => {
   ];
 
   const USERS_CAN_DELETE_MEDIA = ['Thiago Ventura Valencio', 'William Barbosa', 'Augusto', 'Wilson', 'Rosely'];
-
   const STATUS_LIST = [ 'Aguardando-Mecanico', 'Em-Analise', 'Orcamento-Enviado', 'Aguardando-Aprovacao', 'Servico-Autorizado', 'Em-Execucao', 'Finalizado-Aguardando-Retirada', 'Entregue' ];
   const ATTENTION_STATUSES = { 'Aguardando-Mecanico': { label: 'AGUARDANDO MECÂNICO', color: 'yellow', blinkClass: 'blinking-aguardando' }, 'Servico-Autorizado': { label: 'SERVIÇO AUTORIZADO', color: 'green', blinkClass: 'blinking-autorizado' } };
   const LED_TRIGGER_STATUSES = ['Aguardando-Mecanico', 'Servico-Autorizado'];
 
-  // Seletores de elementos DOM
+  // Seletores
   const userScreen = document.getElementById('userScreen');
   const app = document.getElementById('app');
   const loginForm = document.getElementById('loginForm');
@@ -326,7 +362,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const exportReportBtn = document.getElementById('exportReportBtn');
   const arBtn = document.getElementById('arBtn');
 
-
   const formatStatus = (status) => status.replace(/-/g, ' ');
 
   const logoutUser = () => {
@@ -338,14 +373,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const now = new Date();
     const logoutTime = new Date();
     logoutTime.setHours(19, 0, 0, 0);
-
     if (now > logoutTime) {
       logoutTime.setDate(logoutTime.getDate() + 1);
     }
-
     const timeUntilLogout = logoutTime.getTime() - now.getTime();
     console.log(`Logout agendado via setTimeout para: ${logoutTime.toLocaleString('pt-BR')}`);
-
     setTimeout(() => {
       if (localStorage.getItem('currentUserSession')) {
         showNotification('Sessão encerrada por segurança.', 'success');
@@ -355,12 +387,8 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   const loginUser = (user) => {
-    const sessionData = {
-      user: user,
-      loginTime: new Date().toISOString()
-    };
+    const sessionData = { user: user, loginTime: new Date().toISOString() };
     localStorage.setItem('currentUserSession', JSON.stringify(sessionData));
-    
     currentUser = user;
     document.getElementById('currentUserName').textContent = user.name;
     userScreen.classList.add('hidden');
@@ -372,9 +400,7 @@ document.addEventListener('DOMContentLoaded', () => {
     listenToCloudinaryConfigs(); 
     scheduleDailyLogout();
 
-    if (arBtn) {
-        arBtn.classList.remove('hidden');
-    }
+    if (arBtn) arBtn.classList.remove('hidden');
 
     if (user.name === 'Thiago Ventura Valencio') {
       adminBtn.classList.remove('hidden');
@@ -384,25 +410,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const initializeLoginScreen = () => {
     const storedSession = localStorage.getItem('currentUserSession');
-    
     if (storedSession) {
         const sessionData = JSON.parse(storedSession);
         const loginTime = new Date(sessionData.loginTime);
-
         const now = new Date();
         const lastCutoff = new Date();
         lastCutoff.setHours(19, 0, 0, 0);
-
-        if (now < lastCutoff) {
-            lastCutoff.setDate(lastCutoff.getDate() - 1);
-        }
+        if (now < lastCutoff) lastCutoff.setDate(lastCutoff.getDate() - 1);
 
         if (loginTime < lastCutoff) {
             console.log("Sessão expirada. Realizando logout forçado.");
             logoutUser();
             return;
         }
-        
         loginUser(sessionData.user);
         return;
     }
@@ -544,41 +564,29 @@ document.addEventListener('DOMContentLoaded', () => {
       });
   }
 
-  // --- ESCUTAR CONFIGURAÇÕES DO CLOUDINARY (LEGADO E CORREÇÃO DE ERRO DO BANCO) ---
+  // --- ESCUTAR CONFIGURAÇÕES DO CLOUDINARY (Lógica Time Machine - LEITURA) ---
   const listenToCloudinaryConfigs = () => {
     const configRef = db.ref('cloudinaryConfigs').orderByChild('timestamp');
     configRef.on('value', snapshot => {
       if (snapshot.exists()) {
         const configs = snapshot.val();
-        
         allCloudinaryConfigs = configs;
         
         sortedCloudinaryConfigs = [];
         snapshot.forEach(childSnapshot => {
             const data = childSnapshot.val();
-            // CORREÇÃO CRÍTICA: Remove espaços do banco de dados (o bug do "-Ol1...") via código
-            if (data.cloudName) data.cloudName = data.cloudName.trim();
-            
-            sortedCloudinaryConfigs.push({
-                ...data,
-                key: childSnapshot.key
-            });
+            if (data.cloudName) data.cloudName = data.cloudName.trim(); // Limpeza de espaço
+            sortedCloudinaryConfigs.push({ ...data, key: childSnapshot.key });
         });
         
-        // Garante ordenação cronológica do mais antigo pro mais novo
         sortedCloudinaryConfigs.sort((a, b) => a.timestamp - b.timestamp);
 
-        // A última config é a ATIVA
         if (sortedCloudinaryConfigs.length > 0) {
-            const latestConfig = sortedCloudinaryConfigs[sortedCloudinaryConfigs.length - 1];
-            activeCloudinaryConfig = { ...latestConfig, key: latestConfig.key };
-            
-            const usageText = latestConfig.usage ? ` | Enviado: ${formatBytes(latestConfig.usage)}` : ' | Enviado: 0 B';
-            activeCloudinaryInfo.textContent = `Ativo: ${activeCloudinaryConfig.cloudName} | ${activeCloudinaryConfig.uploadPreset}${usageText}`;
+            activeCloudinaryConfig = sortedCloudinaryConfigs[sortedCloudinaryConfigs.length - 1];
+            activeCloudinaryInfo.textContent = `Híbrido: Imagens (Firebase) / Vídeos (Cloudinary: ${activeCloudinaryConfig.cloudName})`;
         }
       } else {
-        activeCloudinaryInfo.textContent = 'Nenhuma conta configurada. Adicione uma para fazer uploads.';
-        showNotification('ATENÇÃO: Nenhuma conta de mídia configurada. Os uploads não funcionarão.', 'error');
+        activeCloudinaryInfo.textContent = 'Modo Híbrido Ativo (Sem Cloudinary configurado)';
       }
     });
   };
@@ -719,20 +727,17 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
-  // --- RENDERIZAÇÃO DE MÍDIA COM TODAS AS CORREÇÕES (HOTLINK, ESPAÇO, MÁQUINA DO TEMPO) ---
+  // --- RENDERIZAÇÃO DE MÍDIA HÍBRIDA (FIREBASE + CLOUDINARY) ---
   const renderMediaGallery = (os) => {
     const media = os.media || {};
     const mediaEntries = Object.entries(media);
     
-    // Mapeamento correto com reconstrução de URL
     lightboxMedia = mediaEntries.map(entry => {
         const item = entry[1];
         if (!item) return null;
         
-        // RECONSTRÓI A URL CORRETA (resolve paths relativos e cloudnames)
+        // Reconstrói URL (Time Machine)
         const fixedUrl = reconstructUrl(item);
-        
-        // Tenta descobrir o tipo (para antigos sem 'type')
         const type = item.type || getMediaTypeFromUrl(fixedUrl);
         
         return {...item, url: fixedUrl, type: type, key: entry[0]};
@@ -753,8 +758,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let thumbnailContent = `<i class='bx bx-file text-4xl text-gray-500'></i>`;
         
         if (isImage) { 
-            // CORREÇÃO MÁGICA PARA ERRO 401: referrerPolicy="no-referrer"
-            // CORREÇÃO VISUAL: onerror substitui por placeholder em caso de falha total
+            // CORREÇÃO CRÍTICA: referrerPolicy para Cloudinary antigo + fallback
             thumbnailContent = `<img src="${item.url}" alt="Mídia" loading="lazy" class="w-full h-full object-cover" referrerpolicy="no-referrer" onerror="this.onerror=null;this.parentElement.innerHTML='<div class=\\'flex flex-col items-center justify-center h-full text-gray-400\\'><i class=\\'bx bxs-error text-2xl\\'></i><span class=\\'text-xs\\'>Indisponível</span></div>';">`; 
         } else if (isVideo) { 
             thumbnailContent = `<i class='bx bx-play-circle text-4xl text-blue-500'></i>`; 
@@ -788,7 +792,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }).join('');
     const media = os.media ? Object.values(os.media) : [];
     
-    // Filtro melhorado para impressão (reconstrói URLs aqui também)
+    // Filtro para impressão
     const photos = media.map(item => {
         const fixedUrl = reconstructUrl(item);
         const type = item.type || getMediaTypeFromUrl(fixedUrl);
@@ -808,14 +812,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const media = lightboxMedia[index];
     if (!media) return; 
     
-    // A URL já foi corrigida no renderMediaGallery, então apenas usamos
     const type = media.type || 'image/jpeg';
 
     if (type === 'application/pdf') { window.open(media.url, '_blank'); return; }
     
     const lightboxContent = document.getElementById('lightbox-content');
     if (type.startsWith('image/')) {
-      // CORREÇÃO TAMBÉM NO LIGHTBOX: referrerpolicy
       lightboxContent.innerHTML = `<img src="${media.url}" alt="Imagem" class="max-w-full max-h-full object-contain" referrerpolicy="no-referrer">`;
     } else {
       lightboxContent.innerHTML = `<video src="${media.url}" controls class="max-w-full max-h-full"></video>`;
@@ -1000,6 +1002,7 @@ document.addEventListener('DOMContentLoaded', () => {
     osModal.classList.add('hidden');
   });
 
+  // UPLOAD HÍBRIDO NO SUBMIT
   logForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const submitBtn = e.target.querySelector('button[type="submit"]');
@@ -1012,34 +1015,24 @@ document.addEventListener('DOMContentLoaded', () => {
     const logEntry = { timestamp: new Date().toISOString(), user: currentUser.name, description: description, type: 'log', parts: parts || null, value: value || null };
     try {
         if (filesToUpload && filesToUpload.length > 0) {
-            submitBtn.innerHTML = `<i class='bx bx-loader-alt bx-spin'></i> Enviando mídia...`;
-            const mediaPromises = filesToUpload.map(file =>
-                uploadFileToCloudinary(file).then(result => ({
-                    type: file.type,
-                    url: result.url,
-                    configKey: result.configKey,
-                    name: file.name,
-                    timestamp: new Date().toISOString(),
-                    bytes: result.bytes // Passa os bytes para o próximo passo
-                }))
-            );
+            submitBtn.innerHTML = `<i class='bx bx-loader-alt bx-spin'></i> Processando mídia...`;
+            
+            // Lógica de Upload Híbrida
+            const mediaPromises = filesToUpload.map(file => processUpload(file, db).then(result => ({
+                type: file.type,
+                url: result.url,
+                name: file.name,
+                timestamp: new Date().toISOString(),
+                bytes: result.bytes,
+                storage: result.storageType || 'unknown'
+            })));
+            
             const mediaResults = await Promise.all(mediaPromises);
             
-            // SOMAR USO E SALVAR NO BANCO
-            let totalBytesUploaded = 0;
             const mediaRef = db.ref(`serviceOrders/${osId}/media`);
             mediaResults.forEach(result => {
                 mediaRef.push().set(result);
-                if (result.bytes) totalBytesUploaded += result.bytes;
             });
-
-            // Atualiza o contador de uso na config ativa
-            if (totalBytesUploaded > 0 && activeCloudinaryConfig && activeCloudinaryConfig.key) {
-                const configRef = db.ref(`cloudinaryConfigs/${activeCloudinaryConfig.key}/usage`);
-                configRef.transaction(currentUsage => {
-                    return (currentUsage || 0) + totalBytesUploaded;
-                });
-            }
         }
         const logsRef = db.ref(`serviceOrders/${osId}/logs`);
         const newLogRef = logsRef.push();
